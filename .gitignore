@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Streamlit secrets and local config
+.streamlit/secrets.toml
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Local model and generated artifacts
+*.keras
+*.h5
+models/
+
+# Optional local run helpers
+*.log
+
+# Local scratch files not meant for deploy
+app copy.py
+app.txt
