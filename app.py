@@ -1,25 +1,527 @@
 # app.py
 
+import os
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
 import matplotlib.pyplot as plt
-import os
+import matplotlib.dates as mdates
+import hashlib
+import re
+from io import BytesIO
+import joblib
 from supabase import create_client, Client
 
 # ----------------------------------------
 # Supabase Configuration
 # ----------------------------------------
-SUPABASE_URL = "https://bqumqfdisvihzknhaaej.supabase.co"
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+DEFAULT_SUPABASE_URL = "https://bqumqfdisvihzknhaaej.supabase.co"
+MODEL_SUITES_DIR = os.path.join("models", "saved_suites")
+MODEL_SUITE_VERSION = "v6"
+SEQUENCE_LENGTH = 60
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-MAIN_APP_URL = os.getenv("MAIN_APP_URL", "http://localhost:8501")
-RESET_APP_URL = os.getenv("RESET_APP_URL", "http://localhost:8502")
+
+def get_secret_value(key, default=""):
+    env_value = os.getenv(key)
+    if env_value not in (None, ""):
+        return env_value
+
+    try:
+        secret_value = st.secrets.get(key, default)
+        if secret_value not in (None, ""):
+            return secret_value
+    except Exception:
+        pass
+
+    return default
+
+
+SUPABASE_URL = get_secret_value("SUPABASE_URL", DEFAULT_SUPABASE_URL)
+SUPABASE_KEY = get_secret_value("SUPABASE_KEY", "")
+MAIN_APP_URL = get_secret_value("MAIN_APP_URL", "http://localhost:8501")
+RESET_APP_URL = get_secret_value("RESET_APP_URL", "http://localhost:8502")
+ADMIN_PANEL_URL = get_secret_value("ADMIN_PANEL_URL", "http://localhost:8503")
+
+
+@st.cache_resource(show_spinner=False)
+def get_supabase_client():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        return None
+
+
+def get_upload_signature(file_name, file_bytes):
+    payload = file_name.encode("utf-8") + file_bytes
+    return hashlib.md5(payload).hexdigest()
+
+
+@st.cache_data(show_spinner=False)
+def load_uploaded_dataframe(file_bytes: bytes):
+    df = pd.read_csv(BytesIO(file_bytes))
+    return clean_uploaded_dataframe(df)
+
+
+def get_nested_value(value, key, default=None):
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        return value.get(key, default)
+    if hasattr(value, key):
+        return getattr(value, key)
+    if hasattr(value, "model_dump"):
+        try:
+            dumped = value.model_dump()
+            if isinstance(dumped, dict):
+                return dumped.get(key, default)
+        except Exception:
+            return default
+    return default
+
+
+def is_user_disabled(user) -> bool:
+    app_metadata = get_nested_value(user, "app_metadata", {}) or {}
+    return bool(app_metadata.get("disabled", False))
+
+
+def is_admin_user(user) -> bool:
+    app_metadata = get_nested_value(user, "app_metadata", {}) or {}
+    return str(app_metadata.get("role", "")).strip().lower() == "admin"
+
+
+def clean_uploaded_dataframe(df: pd.DataFrame):
+    cleaned_df = df.copy()
+    cleaned_df.columns = [str(col).strip() for col in cleaned_df.columns]
+    cleaned_df = cleaned_df.replace(["None", "none", "nan", "NaN", ""], np.nan)
+
+    parsed_date_column = None
+
+    if "Date" in cleaned_df.columns:
+        parsed_dates = pd.to_datetime(cleaned_df["Date"], errors="coerce")
+        if parsed_dates.notna().sum() >= 3:
+            parsed_date_column = "Date"
+            cleaned_df["Date"] = parsed_dates
+
+    if parsed_date_column is None:
+        for column in cleaned_df.columns:
+            parsed_dates = pd.to_datetime(cleaned_df[column], errors="coerce")
+            if parsed_dates.notna().sum() >= 3:
+                parsed_date_column = column
+                if column != "Date":
+                    cleaned_df = cleaned_df.rename(columns={column: "Date"})
+                cleaned_df["Date"] = pd.to_datetime(cleaned_df["Date"], errors="coerce")
+                break
+
+    for column in cleaned_df.columns:
+        if column == "Date":
+            continue
+        cleaned_df[column] = pd.to_numeric(cleaned_df[column], errors="coerce")
+
+    numeric_cols = cleaned_df.select_dtypes(include=[np.number]).columns.tolist()
+
+    if parsed_date_column is not None:
+        cleaned_df = cleaned_df[cleaned_df["Date"].notna()]
+        if numeric_cols:
+            cleaned_df = cleaned_df.dropna(subset=numeric_cols, how="all")
+        cleaned_df = cleaned_df.sort_values("Date")
+
+    cleaned_df = cleaned_df.reset_index(drop=True)
+    return cleaned_df
+
+
+def build_dataset_signature(df: pd.DataFrame, feature_names, target_column):
+    signature_columns = list(feature_names)
+    if "Date" in df.columns:
+        signature_columns = ["Date", *signature_columns]
+
+    signature_df = df[signature_columns].copy()
+
+    if "Date" in signature_df.columns:
+        signature_df["Date"] = pd.to_datetime(signature_df["Date"], errors="coerce").astype("int64")
+
+    hash_values = pd.util.hash_pandas_object(signature_df, index=True).values
+    payload = hash_values.tobytes() + "|".join(feature_names).encode("utf-8") + f"|{target_column}".encode("utf-8")
+    return hashlib.md5(payload).hexdigest()
+
+
+def build_sequences(data, sequence_length, target_index):
+    X, y = [], []
+
+    for i in range(sequence_length, len(data)):
+        X.append(data[i-sequence_length:i])
+        y.append(data[i, target_index])
+
+    return np.array(X), np.array(y)
+
+
+def inverse_target_values(scaled_values, scaler, feature_count, target_index):
+    temp = np.zeros((len(scaled_values), feature_count))
+    temp[:, target_index] = np.asarray(scaled_values).reshape(-1)
+    return scaler.inverse_transform(temp)[:, target_index]
+
+
+def slugify_name(value):
+    slug = re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower())
+    return slug.strip("_") or "model"
+
+
+def get_suite_dir(suite_key):
+    suite_hash = hashlib.md5(suite_key.encode("utf-8")).hexdigest()
+    return os.path.join(MODEL_SUITES_DIR, suite_hash)
+
+
+def get_suite_meta_path(suite_key):
+    return os.path.join(get_suite_dir(suite_key), "suite_meta.joblib")
+
+
+def save_candidate_artifact(candidate, suite_dir):
+    model_name = candidate["name"]
+    kind = candidate["kind"]
+    model_slug = slugify_name(model_name)
+    artifact_path = None
+
+    if kind == "sequence" and candidate.get("model") is not None:
+        artifact_path = os.path.join(suite_dir, f"{model_slug}.keras")
+        candidate["model"].save(artifact_path)
+    elif kind in {"tabular", "stat"} and candidate.get("model") is not None:
+        artifact_path = os.path.join(suite_dir, f"{model_slug}.joblib")
+        joblib.dump(candidate["model"], artifact_path)
+
+    return artifact_path
+
+
+def load_candidate_artifact(record):
+    kind = record.get("kind")
+    artifact_path = record.get("artifact_path")
+
+    if not artifact_path:
+        return None
+
+    if not os.path.exists(artifact_path):
+        raise FileNotFoundError(f"Missing saved artifact: {artifact_path}")
+
+    if kind == "sequence":
+        return tf.keras.models.load_model(artifact_path)
+
+    return joblib.load(artifact_path)
+
+
+def save_model_suite(suite_key, leaderboard_df, best_model_name, candidate_models):
+    suite_dir = get_suite_dir(suite_key)
+    os.makedirs(suite_dir, exist_ok=True)
+
+    saved_models = {}
+    for model_name, candidate in candidate_models.items():
+        artifact_path = save_candidate_artifact(candidate, suite_dir)
+        saved_models[model_name] = {
+            "name": candidate["name"],
+            "kind": candidate["kind"],
+            "artifact_path": artifact_path,
+            "predictions_actual": np.asarray(candidate["predictions_actual"]).reshape(-1).tolist(),
+            "note": candidate.get("note", ""),
+        }
+
+    payload = {
+        "key": suite_key,
+        "best_model_name": best_model_name,
+        "leaderboard": leaderboard_df.to_dict(orient="records"),
+        "models": saved_models,
+    }
+    joblib.dump(payload, get_suite_meta_path(suite_key))
+
+
+def load_model_suite(suite_key):
+    meta_path = get_suite_meta_path(suite_key)
+    if not os.path.exists(meta_path):
+        return None
+
+    try:
+        payload = joblib.load(meta_path)
+        if payload.get("key") != suite_key:
+            return None
+
+        models = {}
+        loaded_any_runtime_model = False
+        for model_name, record in payload.get("models", {}).items():
+            loaded_model = None
+            load_error = ""
+
+            if record.get("artifact_path"):
+                try:
+                    loaded_model = load_candidate_artifact(record)
+                    loaded_any_runtime_model = True
+                except Exception as exc:
+                    load_error = str(exc)
+
+            models[model_name] = {
+                "name": record["name"],
+                "kind": record["kind"],
+                "model": loaded_model,
+                "predictions_actual": np.asarray(record.get("predictions_actual", []), dtype=float),
+                "note": record.get("note", ""),
+                "load_error": load_error,
+            }
+
+        if not models:
+            return None
+
+        # Baseline has no artifact, so this keeps saved suites usable even if some optional artifacts fail.
+        if not loaded_any_runtime_model and "Naive Baseline" not in models:
+            return None
+
+        return {
+            "key": payload["key"],
+            "best_model_name": payload["best_model_name"],
+            "leaderboard": pd.DataFrame(payload.get("leaderboard", [])),
+            "models": models,
+        }
+    except Exception:
+        return None
+
+
+def evaluate_predictions(actual, predicted):
+    return {
+        "MAE": float(mean_absolute_error(actual, predicted)),
+        "RMSE": float(np.sqrt(mean_squared_error(actual, predicted))),
+        "R2": float(r2_score(actual, predicted)),
+    }
+
+
+def rank_trained_models(leaderboard_df):
+    trained_df = leaderboard_df[leaderboard_df["Status"] == "trained"].copy()
+    if trained_df.empty:
+        return trained_df
+
+    return trained_df.sort_values(["R2", "RMSE", "MAE"], ascending=[False, True, True])
+
+
+def get_best_model_name(leaderboard_df):
+    ranked_df = rank_trained_models(leaderboard_df)
+    if ranked_df.empty:
+        return None
+    return ranked_df.iloc[0]["Model"]
+
+
+def get_available_model_names(ranked_df, model_suite):
+    available_names = []
+    models = model_suite.get("models", {})
+
+    for model_name in ranked_df["Model"].tolist():
+        candidate = models.get(model_name)
+        if not candidate:
+            continue
+
+        if candidate["kind"] == "baseline" or candidate.get("model") is not None:
+            available_names.append(model_name)
+
+    return available_names
+
+
+def get_validation_data(X_train, y_train):
+    if len(X_train) < 12:
+        return X_train, y_train, None, None
+
+    val_size = max(1, int(len(X_train) * 0.1))
+    if len(X_train) - val_size < 1:
+        return X_train, y_train, None, None
+
+    return X_train[:-val_size], y_train[:-val_size], X_train[-val_size:], y_train[-val_size:]
+
+
+def build_lstm_model(input_shape):
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=input_shape),
+        tf.keras.layers.LSTM(96, return_sequences=True),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.LSTM(48),
+        tf.keras.layers.Dense(24, activation="relu"),
+        tf.keras.layers.Dense(1),
+    ])
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss=tf.keras.losses.Huber(),
+    )
+    return model
+
+
+def build_gru_model(input_shape):
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=input_shape),
+        tf.keras.layers.GRU(96, return_sequences=True),
+        tf.keras.layers.Dropout(0.15),
+        tf.keras.layers.GRU(48),
+        tf.keras.layers.Dense(24, activation="relu"),
+        tf.keras.layers.Dense(1),
+    ])
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss=tf.keras.losses.Huber(),
+    )
+    return model
+
+
+def build_bilstm_model(input_shape):
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=input_shape),
+        tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(64, return_sequences=True)),
+        tf.keras.layers.Dropout(0.15),
+        tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(32)),
+        tf.keras.layers.Dense(24, activation="relu"),
+        tf.keras.layers.Dense(1),
+    ])
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss=tf.keras.losses.Huber(),
+    )
+    return model
+
+
+def build_transformer_model(input_shape):
+    inputs = tf.keras.layers.Input(shape=input_shape)
+    x = tf.keras.layers.LayerNormalization()(inputs)
+    attention = tf.keras.layers.MultiHeadAttention(
+        num_heads=4,
+        key_dim=max(8, input_shape[-1]),
+        dropout=0.1,
+    )(x, x)
+    x = tf.keras.layers.Add()([inputs, attention])
+    y = tf.keras.layers.LayerNormalization()(x)
+    y = tf.keras.layers.Dense(64, activation="relu")(y)
+    y = tf.keras.layers.Dense(input_shape[-1])(y)
+    y = tf.keras.layers.Dropout(0.1)(y)
+    x = tf.keras.layers.Add()([x, y])
+    x = tf.keras.layers.GlobalAveragePooling1D()(x)
+    x = tf.keras.layers.Dense(32, activation="relu")(x)
+    outputs = tf.keras.layers.Dense(1)(x)
+    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss=tf.keras.losses.Huber(),
+    )
+    return model
+
+
+def train_sequence_model(name, builder, X_train, y_train, X_test, note):
+    tf.keras.backend.clear_session()
+    tf.keras.utils.set_random_seed(42)
+
+    X_fit, y_fit, X_val, y_val = get_validation_data(X_train, y_train)
+    model = builder((X_train.shape[1], X_train.shape[2]))
+
+    fit_kwargs = {
+        "x": X_fit,
+        "y": y_fit,
+        "epochs": 40,
+        "batch_size": 32,
+        "verbose": 0,
+        "shuffle": False,
+    }
+
+    if X_val is not None and y_val is not None:
+        fit_kwargs["validation_data"] = (X_val, y_val)
+        fit_kwargs["callbacks"] = [
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=6,
+                restore_best_weights=True,
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=0.5,
+                patience=3,
+                min_lr=1e-5,
+            ),
+        ]
+
+    history = model.fit(**fit_kwargs)
+    epochs_used = len(history.history.get("loss", []))
+    val_loss = history.history.get("val_loss", [])
+    training_note = f"{note} Early stopping with dropout regularization; epochs used: {epochs_used}."
+    if val_loss:
+        training_note += f" Best validation loss: {min(val_loss):.4f}."
+
+    predictions = model.predict(X_test, verbose=0).reshape(-1)
+    return {
+        "name": name,
+        "kind": "sequence",
+        "model": model,
+        "predictions": predictions,
+        "note": training_note,
+    }
+
+
+def train_tuned_tabular_model(name, configs, X_train_flat, y_train, X_test_flat):
+    X_fit, y_fit, X_val, y_val = get_validation_data(X_train_flat, y_train)
+    best_config = None
+    best_rmse = None
+
+    for config_note, builder in configs:
+        estimator = builder()
+        estimator.fit(X_fit, y_fit)
+
+        if X_val is not None and y_val is not None:
+            val_predictions = np.asarray(estimator.predict(X_val)).reshape(-1)
+            val_rmse = float(np.sqrt(mean_squared_error(y_val, val_predictions)))
+        else:
+            val_predictions = np.asarray(estimator.predict(X_fit)).reshape(-1)
+            val_rmse = float(np.sqrt(mean_squared_error(y_fit, val_predictions)))
+
+        if best_rmse is None or val_rmse < best_rmse:
+            best_rmse = val_rmse
+            best_config = (config_note, builder)
+
+    if best_config is None:
+        raise ValueError(f"No valid configuration succeeded for {name}.")
+
+    selected_note, selected_builder = best_config
+    final_model = selected_builder()
+    final_model.fit(X_train_flat, y_train)
+    predictions = np.asarray(final_model.predict(X_test_flat)).reshape(-1)
+
+    return {
+        "name": name,
+        "kind": "tabular",
+        "model": final_model,
+        "predictions": predictions,
+        "note": f"{selected_note} Selected with validation RMSE {best_rmse:.4f}.",
+    }
+
+
+def recursive_forecast(candidate, scaled_data, target_index, scaler, feature_count, days_ahead, recent_target_values=None):
+    if candidate["kind"] == "baseline":
+        last_value = float(recent_target_values[-1])
+        return np.repeat(last_value, days_ahead)
+
+    if candidate["kind"] == "stat":
+        return np.asarray(candidate["model"].forecast(steps=days_ahead)).reshape(-1)
+
+    seq = scaled_data[-SEQUENCE_LENGTH:].copy()
+    preds_scaled = []
+
+    for _ in range(days_ahead):
+        if candidate["kind"] == "sequence":
+            pred = candidate["model"].predict(seq.reshape(1, SEQUENCE_LENGTH, seq.shape[1]), verbose=0)
+            pred_value = float(pred[0][0])
+        else:
+            pred_value = float(candidate["model"].predict(seq.reshape(1, -1))[0])
+
+        preds_scaled.append(pred_value)
+        new_row = seq[-1].copy()
+        new_row[target_index] = pred_value
+        seq = np.vstack([seq[1:], new_row])
+
+    return inverse_target_values(preds_scaled, scaler, feature_count, target_index)
 
 
 def inject_custom_styles():
@@ -119,6 +621,66 @@ def inject_custom_styles():
         unsafe_allow_html=True,
     )
 
+
+def render_data_inspection(df: pd.DataFrame):
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    total_missing = int(df.isna().sum().sum())
+
+    st.subheader("Data Inspection")
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Rows", f"{len(df):,}")
+    metric_cols[1].metric("Columns", len(df.columns))
+    metric_cols[2].metric("Numeric Columns", len(numeric_cols))
+    metric_cols[3].metric("Missing Cells", f"{total_missing:,}")
+
+    if "Date" in df.columns and df["Date"].notna().any():
+        start_date = df["Date"].min()
+        end_date = df["Date"].max()
+        if pd.notna(start_date) and pd.notna(end_date):
+            st.caption(f"Date range: {start_date.date()} to {end_date.date()}")
+
+    inspection_df = pd.DataFrame(
+        {
+            "Column": df.columns,
+            "Data Type": [str(df[column].dtype) for column in df.columns],
+            "Missing": [int(df[column].isna().sum()) for column in df.columns],
+            "Missing %": [
+                round((df[column].isna().sum() / len(df)) * 100, 2) if len(df) else 0.0
+                for column in df.columns
+            ],
+            "Unique Values": [int(df[column].nunique(dropna=True)) for column in df.columns],
+        }
+    )
+
+    st.dataframe(inspection_df, use_container_width=True)
+
+    if numeric_cols:
+        st.caption("Numeric summary")
+        st.dataframe(df[numeric_cols].describe().transpose(), use_container_width=True)
+
+        st.caption("Closing Price Movement Over Years")
+        if "Close" in df.columns and "Date" in df.columns and df["Date"].notna().any():
+            trend_df = (
+                df[["Date", "Close"]]
+                .dropna()
+                .sort_values("Date")
+            )
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(trend_df["Date"], trend_df["Close"], color="#1d9bf0", linewidth=2)
+            ax.set_title("Closing Price Movement Over Years")
+            ax.set_xlabel("Years")
+            ax.set_ylabel("Prices")
+            ax.xaxis.set_major_locator(mdates.YearLocator())
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+            fig.autofmt_xdate()
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.info("Close and Date columns are required to display the closing price movement chart with years on the x-axis.")
+    else:
+        st.info("No numeric columns available for summary statistics.")
+
+
 # ----------------------------------------
 # Session State Initialization
 # ----------------------------------------
@@ -131,14 +693,23 @@ if "user" not in st.session_state:
 if "upload_count" not in st.session_state:
     st.session_state.upload_count = 0
 
+if "seen_upload_signatures" not in st.session_state:
+    st.session_state.seen_upload_signatures = []
+
+if "active_upload_signature" not in st.session_state:
+    st.session_state.active_upload_signature = None
+
+
 # ----------------------------------------
 # Page Config (MUST BE FIRST)
 # ----------------------------------------
 st.set_page_config(page_title="Stock Predictor", layout="wide")
 inject_custom_styles()
+supabase = get_supabase_client()
+
 
 # ----------------------------------------
-# 🔐 AUTH SECTION (NOT LOGGED IN)
+# AUTH SECTION (NOT LOGGED IN)
 # ----------------------------------------
 if not st.session_state.logged_in:
     st.sidebar.markdown(
@@ -151,83 +722,112 @@ if not st.session_state.logged_in:
         unsafe_allow_html=True,
     )
 
+    if supabase is None:
+        st.sidebar.info("Authentication is disabled until Supabase secrets are configured in Streamlit Cloud.")
+
     login_tab, register_tab, reset_tab = st.sidebar.tabs(["Login", "Register", "Reset Password"])
 
     with login_tab:
-        with st.form("login_form", clear_on_submit=True):
-            login_email = st.text_input("Email", key="login_email")
-            login_password = st.text_input("Password", type="password", key="login_password")
-            login_btn = st.form_submit_button("Login")
+        if supabase is None:
+            st.caption("Set `SUPABASE_URL` and `SUPABASE_KEY` in Streamlit Cloud secrets to enable login.")
+        else:
+            with st.form("login_form", clear_on_submit=True):
+                login_email = st.text_input("Email", key="login_email")
+                login_password = st.text_input("Password", type="password", key="login_password")
+                login_btn = st.form_submit_button("Login")
 
-        if login_btn:
-            try:
-                response = supabase.auth.sign_in_with_password({
-                    "email": login_email,
-                    "password": login_password
-                })
+            if login_btn:
+                try:
+                    response = supabase.auth.sign_in_with_password({
+                        "email": login_email,
+                        "password": login_password
+                    })
 
-                if response.user:
-                    st.session_state.logged_in = True
-                    st.session_state.user = response.user
-                    st.sidebar.success("Login successful ✅")
-                    st.rerun()
-                else:
-                    st.sidebar.error("Login failed ❌")
-            except Exception:
-                st.sidebar.error("Invalid credentials ❌")
+                    if response.user:
+                        if is_user_disabled(response.user):
+                            try:
+                                supabase.auth.sign_out()
+                            except Exception:
+                                pass
+                            st.sidebar.error("This account has been disabled. Contact admin.")
+                        else:
+                            st.session_state.logged_in = True
+                            st.session_state.user = response.user
+                            st.sidebar.success("Login successful ✅")
+                            st.rerun()
+                    else:
+                        st.sidebar.error("Login failed ❌")
+                except Exception:
+                    st.sidebar.error("Invalid credentials ❌")
 
     with register_tab:
-        with st.form("register_form", clear_on_submit=True):
-            first_name = st.text_input("First Name", key="register_first_name")
-            last_name = st.text_input("Last Name", key="register_last_name")
-            email = st.text_input("Email", key="register_email")
-            confirm_email = st.text_input("Confirm Email", key="register_confirm_email")
-            password = st.text_input("Password", type="password", key="register_password")
-            confirm_password = st.text_input("Confirm Password", type="password", key="register_confirm_password")
-            register_btn = st.form_submit_button("Create Account")
+        if supabase is None:
+            st.caption("Registration is disabled until Supabase secrets are configured.")
+        else:
+            with st.form("register_form", clear_on_submit=True):
+                first_name = st.text_input("First Name", key="register_first_name")
+                last_name = st.text_input("Last Name", key="register_last_name")
+                email = st.text_input("Email", key="register_email")
+                confirm_email = st.text_input("Confirm Email", key="register_confirm_email")
+                password = st.text_input("Password", type="password", key="register_password")
+                confirm_password = st.text_input("Confirm Password", type="password", key="register_confirm_password")
+                register_btn = st.form_submit_button("Create Account")
 
-        if register_btn:
-            first_name = first_name.strip()
-            last_name = last_name.strip()
-            email = email.strip().lower()
-            confirm_email = confirm_email.strip().lower()
+            if register_btn:
+                first_name = first_name.strip()
+                last_name = last_name.strip()
+                email = email.strip().lower()
+                confirm_email = confirm_email.strip().lower()
 
-            if not first_name or not last_name:
-                st.sidebar.error("Enter your first and last name.")
-            elif email != confirm_email:
-                st.sidebar.error("Emails do not match ❌")
-            elif len(password) < 6:
-                st.sidebar.error("Password must be at least 6 characters.")
-            elif password != confirm_password:
-                st.sidebar.error("Passwords do not match ❌")
-            else:
-                try:
-                    res = supabase.auth.sign_up({
-                        "email": email,
-                        "password": password,
-                        "options": {
-                            "data": {
-                                "first_name": first_name,
-                                "last_name": last_name,
-                                "full_name": f"{first_name} {last_name}".strip(),
-                            }
-                        },
-                    })
-                    if res.user:
-                        st.sidebar.success("Registration successful ✅")
-                except Exception as e:
-                    st.sidebar.error(f"Error: {e}")
+                if not first_name or not last_name:
+                    st.sidebar.error("Enter your first and last name.")
+                elif email != confirm_email:
+                    st.sidebar.error("Emails do not match ❌")
+                elif len(password) < 6:
+                    st.sidebar.error("Password must be at least 6 characters.")
+                elif password != confirm_password:
+                    st.sidebar.error("Passwords do not match ❌")
+                else:
+                    try:
+                        res = supabase.auth.sign_up({
+                            "email": email,
+                            "password": password,
+                            "options": {
+                                "data": {
+                                    "first_name": first_name,
+                                    "last_name": last_name,
+                                    "full_name": f"{first_name} {last_name}".strip(),
+                                }
+                            },
+                        })
+                        if res.user:
+                            st.sidebar.success("Registration successful ✅")
+                    except Exception as e:
+                        st.sidebar.error(f"Error: {e}")
 
     with reset_tab:
         st.caption("Open the secure password reset page to reset your password with an email OTP.")
         st.link_button("Open Password Reset Page", RESET_APP_URL, use_container_width=True)
         st.markdown(f"[Or open it manually]({RESET_APP_URL})")
 
+
 # ----------------------------------------
-# 👤 USER PANEL (LOGGED IN)
+# USER PANEL (LOGGED IN)
 # ----------------------------------------
 else:
     user = st.session_state.user
+
+    if supabase is None:
+        st.session_state.logged_in = False
+        st.session_state.user = None
+        st.warning("Supabase secrets are not configured, so authenticated features are unavailable.")
+        st.rerun()
+
+    if is_user_disabled(user):
+        st.session_state.logged_in = False
+        st.session_state.user = None
+        st.error("This account has been disabled. Contact admin.")
+        st.stop()
 
     st.sidebar.markdown(
         """
@@ -244,6 +844,11 @@ else:
         st.session_state.logged_in = False
         st.session_state.user = None
         st.rerun()
+
+    if is_admin_user(user):
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("Admin Access")
+        st.sidebar.link_button("Open Admin Panel", ADMIN_PANEL_URL, use_container_width=True)
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("📜 Prediction History")
@@ -274,6 +879,8 @@ else:
 """)
     except Exception as e:
         st.sidebar.error(f"Error loading history: {e}")
+
+
 # ----------------------------------------
 # Main App
 # ----------------------------------------
@@ -287,153 +894,371 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-MODEL_PATH = "multivariate_lstm.keras"
-SEQUENCE_LENGTH = 60
-
-# Upload restriction
-if st.session_state.upload_count >= 2 and not st.session_state.logged_in:
-    st.warning("Upload limit reached. Please login.")
-    st.stop()
-
 uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
 if not uploaded_file:
-    st.info("Upload a dataset to begin.")
-    
+    if st.session_state.upload_count >= 2 and not st.session_state.logged_in:
+        st.warning("Upload limit reached. Please login.")
+    else:
+        st.info("Upload a dataset to begin.")
     st.stop()
+
 
 # ----------------------------------------
 # Load Data
 # ----------------------------------------
-st.session_state.upload_count += 1
-df = pd.read_csv(uploaded_file)
+uploaded_bytes = uploaded_file.getvalue()
+upload_signature = get_upload_signature(uploaded_file.name, uploaded_bytes)
+
+if upload_signature != st.session_state.active_upload_signature:
+    if not st.session_state.logged_in and upload_signature not in st.session_state.seen_upload_signatures:
+        st.session_state.seen_upload_signatures.append(upload_signature)
+        st.session_state.upload_count = len(st.session_state.seen_upload_signatures)
+    st.session_state.active_upload_signature = upload_signature
+
+if st.session_state.upload_count >= 2 and not st.session_state.logged_in and upload_signature not in st.session_state.seen_upload_signatures:
+    st.warning("Upload limit reached. Please login.")
+    st.stop()
+
+df = load_uploaded_dataframe(uploaded_bytes)
 file_name = uploaded_file.name
 
 st.subheader("Preview")
 st.write(df.head())
+render_data_inspection(df)
 
 # Date handling
 if "Date" in df.columns:
-    df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values("Date")
 
 # EMA Features
 if "Close" in df.columns:
-    df["EMA20"] = df["Close"].ewm(span=20).mean()
-    df["EMA50"] = df["Close"].ewm(span=50).mean()
+    close_series = pd.to_numeric(df["Close"], errors="coerce")
+    df["EMA20"] = close_series.ewm(span=20).mean()
+    df["EMA50"] = close_series.ewm(span=50).mean()
+    df["SMA10"] = close_series.rolling(window=10).mean()
+    df["SMA20"] = close_series.rolling(window=20).mean()
+    df["CloseLag1"] = close_series.shift(1)
+    df["CloseLag5"] = close_series.shift(5)
+    df["Return1"] = close_series.pct_change()
+    df["Return5"] = close_series.pct_change(periods=5)
+    df["Volatility10"] = df["Return1"].rolling(window=10).std()
 
 # Numeric columns
 numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].mean())
+if not numeric_cols:
+    st.error("This CSV does not contain numeric columns the stock model can train on. Please upload market data with columns like Date, Open, High, Low, Close, or Volume.")
+    st.stop()
+
+df[numeric_cols] = df[numeric_cols].ffill().bfill()
 
 target_column = st.selectbox("Target Column", numeric_cols)
+if not target_column:
+    st.error("No numeric target column is available in this file.")
+    st.stop()
+
+# Time-aware train/test split
+split_index = max(int(len(df) * 0.8), SEQUENCE_LENGTH + 1)
+split_index = min(split_index, len(df) - 1)
+
+train_df = df.iloc[:split_index].copy()
+test_df = df.iloc[split_index:].copy()
+
+if len(train_df) <= SEQUENCE_LENGTH or len(test_df) == 0:
+    st.error(f"This dataset needs enough rows to create training and test data beyond the {SEQUENCE_LENGTH}-row sequence window.")
+    st.stop()
+
+target_index = numeric_cols.index(target_column)
+dataset_signature = build_dataset_signature(df, numeric_cols, target_column)
 
 # Scaling
 scaler = MinMaxScaler()
-scaled_data = scaler.fit_transform(df[numeric_cols])
+train_scaled = scaler.fit_transform(train_df[numeric_cols])
+scaled_data = scaler.transform(df[numeric_cols])
 
-# Sequences
-X, y = [], []
-target_index = numeric_cols.index(target_column)
+X_train, y_train = build_sequences(train_scaled, SEQUENCE_LENGTH, target_index)
 
-for i in range(SEQUENCE_LENGTH, len(scaled_data)):
-    X.append(scaled_data[i-SEQUENCE_LENGTH:i])
-    y.append(scaled_data[i, target_index])
+test_window_df = df.iloc[split_index - SEQUENCE_LENGTH:].copy()
+test_scaled = scaler.transform(test_window_df[numeric_cols])
+X_test, y_test = build_sequences(test_scaled, SEQUENCE_LENGTH, target_index)
 
-X, y = np.array(X), np.array(y)
+if len(X_train) == 0 or len(y_train) == 0:
+    st.error(f"This dataset needs more than {SEQUENCE_LENGTH} usable rows in the training split after cleaning.")
+    st.stop()
+
+if len(X_test) == 0 or len(y_test) == 0:
+    st.error("This dataset needs more held-out rows to evaluate the model on unseen data.")
+    st.stop()
+
+actual = test_window_df[target_column].iloc[SEQUENCE_LENGTH:].to_numpy()
+
+if "Date" in test_window_df.columns and test_window_df["Date"].notna().any():
+    prediction_dates = test_window_df["Date"].iloc[SEQUENCE_LENGTH:].reset_index(drop=True)
+else:
+    prediction_dates = None
+
 
 # ----------------------------------------
 # Model
 # ----------------------------------------
-retrain = False
+suite_key = f"{MODEL_SUITE_VERSION}|{dataset_signature}|{split_index}|{SEQUENCE_LENGTH}"
+cached_suite = st.session_state.get("model_suite")
 
-if os.path.exists(MODEL_PATH):
-    model = tf.keras.models.load_model(MODEL_PATH)
+if not cached_suite or cached_suite.get("key") != suite_key:
+    cached_suite = load_model_suite(suite_key)
+    if cached_suite:
+        cached_suite["source"] = "saved"
+        st.session_state.model_suite = cached_suite
+        st.info("Loaded saved model suite for this dataset and target column.")
 
-    if model.input_shape[2] != X.shape[2]:
-        retrain = True
+if not cached_suite or cached_suite.get("key") != suite_key:
+    candidate_rows = []
+    candidate_models = {}
+    X_train_flat = X_train.reshape(len(X_train), -1)
+    X_test_flat = X_test.reshape(len(X_test), -1)
+    baseline_predictions = inverse_target_values(X_test[:, -1, target_index], scaler, len(numeric_cols), target_index)
+
+    with st.spinner("Training and comparing models on held-out data..."):
+        baseline_metrics = evaluate_predictions(actual, baseline_predictions)
+        candidate_rows.append({
+            "Model": "Naive Baseline",
+            "Status": "trained",
+            "Notes": "Repeats the last observed target value.",
+            **baseline_metrics,
+        })
+        candidate_models["Naive Baseline"] = {
+            "name": "Naive Baseline",
+            "kind": "baseline",
+            "model": None,
+            "predictions_actual": baseline_predictions,
+            "note": "Repeats the last observed target value.",
+        }
+
+        tabular_candidates = [
+            (
+                "Linear Regression",
+                [
+                    (
+                        "Flattened sequence regression with no regularization; useful as a low-variance benchmark.",
+                        lambda: LinearRegression(),
+                    ),
+                ],
+            ),
+            (
+                "Random Forest",
+                [
+                    (
+                        "Shallow ensemble tuned to reduce overfitting with capped depth and larger leaf size.",
+                        lambda: RandomForestRegressor(
+                            n_estimators=250,
+                            max_depth=10,
+                            min_samples_leaf=4,
+                            random_state=42,
+                            n_jobs=-1,
+                        ),
+                    ),
+                    (
+                        "Slightly deeper ensemble balanced for bias and variance on flattened windows.",
+                        lambda: RandomForestRegressor(
+                            n_estimators=350,
+                            max_depth=14,
+                            min_samples_leaf=2,
+                            random_state=42,
+                            n_jobs=-1,
+                        ),
+                    ),
+                ],
+            ),
+        ]
+
+        for model_name, configs in tabular_candidates:
+            try:
+                trained = train_tuned_tabular_model(model_name, configs, X_train_flat, y_train, X_test_flat)
+                predictions_actual = inverse_target_values(
+                    trained["predictions"],
+                    scaler,
+                    len(numeric_cols),
+                    target_index,
+                )
+                metrics = evaluate_predictions(actual, predictions_actual)
+                candidate_rows.append({
+                    "Model": model_name,
+                    "Status": "trained",
+                    "Notes": trained["note"],
+                    **metrics,
+                })
+                trained["predictions_actual"] = predictions_actual
+                candidate_models[model_name] = trained
+            except Exception as exc:
+                candidate_rows.append({
+                    "Model": model_name,
+                    "Status": "failed",
+                    "Notes": f"Training failed: {exc}",
+                    "MAE": np.nan,
+                    "RMSE": np.nan,
+                    "R2": np.nan,
+                })
+
+        sequence_candidates = [
+            ("LSTM", build_lstm_model, "Stacked LSTM tuned for temporal memory with dropout to curb overfitting."),
+            ("GRU", build_gru_model, "GRU sequence model with lighter recurrent capacity for faster generalization."),
+            ("BiLSTM", build_bilstm_model, "Bidirectional LSTM for richer context, regularized with dropout and early stopping."),
+            ("Transformer", build_transformer_model, "Transformer encoder with attention, residual connections, and early stopping."),
+        ]
+
+        for model_name, builder, note in sequence_candidates:
+            try:
+                trained = train_sequence_model(model_name, builder, X_train, y_train, X_test, note)
+                predictions_actual = inverse_target_values(
+                    trained["predictions"],
+                    scaler,
+                    len(numeric_cols),
+                    target_index,
+                )
+                metrics = evaluate_predictions(actual, predictions_actual)
+                candidate_rows.append({
+                    "Model": model_name,
+                    "Status": "trained",
+                    "Notes": trained["note"],
+                    **metrics,
+                })
+                trained["predictions_actual"] = predictions_actual
+                candidate_models[model_name] = trained
+            except Exception as exc:
+                candidate_rows.append({
+                    "Model": model_name,
+                    "Status": "failed",
+                    "Notes": f"Training failed: {exc}",
+                    "MAE": np.nan,
+                    "RMSE": np.nan,
+                    "R2": np.nan,
+                })
+
+    leaderboard_df = pd.DataFrame(candidate_rows)
+    trained_df = rank_trained_models(leaderboard_df)
+
+    if trained_df.empty:
+        st.error("No models were successfully trained on this dataset.")
+        st.stop()
+
+    best_model_name = get_best_model_name(leaderboard_df)
+    save_model_suite(suite_key, leaderboard_df, best_model_name, candidate_models)
+    st.session_state.model_suite = {
+        "key": suite_key,
+        "leaderboard": leaderboard_df,
+        "best_model_name": best_model_name,
+        "models": candidate_models,
+        "source": "trained",
+    }
+
+model_suite = st.session_state.model_suite
+leaderboard_df = model_suite["leaderboard"].copy()
+trained_df = rank_trained_models(leaderboard_df)
+best_model_name = get_best_model_name(leaderboard_df)
+
+if best_model_name is None:
+    st.error("No trained models are available in the saved suite.")
+    st.stop()
+
+available_model_names = [name for name in trained_df["Model"].tolist() if name in model_suite["models"]]
+default_model_index = available_model_names.index(best_model_name)
+selected_model_name = st.selectbox(
+    "Prediction Model",
+    available_model_names,
+    index=default_model_index,
+    help="The highest-ranked saved or trained model is preselected automatically.",
+)
+selected_candidate = model_suite["models"][selected_model_name]
+selected_is_best = selected_model_name == best_model_name
+
+if model_suite.get("source") == "saved":
+    st.caption("Using saved model artifacts from disk for this dataset and target column.")
 else:
-    retrain = True
+    st.caption("Using freshly trained model artifacts for this dataset and target column.")
 
-if retrain:
-    st.warning("Training model...")
+best_candidate = selected_candidate
+best_predictions = np.asarray(best_candidate["predictions_actual"]).reshape(-1)
+baseline_predictions = np.asarray(model_suite["models"]["Naive Baseline"]["predictions_actual"]).reshape(-1)
 
-    model = tf.keras.Sequential([
-        tf.keras.layers.LSTM(64, return_sequences=True, input_shape=(X.shape[1], X.shape[2])),
-        tf.keras.layers.Dropout(0.2),
-        tf.keras.layers.LSTM(32),
-        tf.keras.layers.Dense(1)
-    ])
+st.subheader("Model Leaderboard")
+st.dataframe(leaderboard_df, use_container_width=True)
+if selected_is_best:
+    st.success(f"Best model selected for future prediction: {selected_model_name}")
+else:
+    st.warning(f"Using {selected_model_name} manually. Best available model is {best_model_name}.")
 
-    model.compile(optimizer="adam", loss="mse")
-    model.fit(X, y, epochs=10, batch_size=32, verbose=1)
-    model.save(MODEL_PATH)
 
 # ----------------------------------------
 # Prediction
 # ----------------------------------------
-predictions = model.predict(X)
-
-temp = np.zeros((len(predictions), len(numeric_cols)))
-temp[:, target_index] = predictions.flatten()
-
-predictions_rescaled = scaler.inverse_transform(temp)[:, target_index]
-actual = df[target_column].values[SEQUENCE_LENGTH:]
-
-# Plot
 st.subheader("Prediction Graph")
-fig, ax = plt.subplots()
-ax.plot(actual, label="Actual")
-ax.plot(predictions_rescaled, label="Predicted")
+fig, ax = plt.subplots(figsize=(10, 4.5))
+
+if prediction_dates is not None:
+    ax.plot(prediction_dates, actual, label=f"Actual {target_column}", linewidth=2)
+    ax.plot(prediction_dates, best_predictions, label=f"{selected_model_name} Prediction", linewidth=2)
+    if selected_model_name != "Naive Baseline":
+        ax.plot(prediction_dates, baseline_predictions, label="Naive Baseline", linewidth=1.5, linestyle="--")
+    ax.set_xlabel("Years")
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    fig.autofmt_xdate()
+else:
+    ax.plot(actual, label=f"Actual {target_column}", linewidth=2)
+    ax.plot(best_predictions, label=f"{selected_model_name} Prediction", linewidth=2)
+    if selected_model_name != "Naive Baseline":
+        ax.plot(baseline_predictions, label="Naive Baseline", linewidth=1.5, linestyle="--")
+    ax.set_xlabel("Observations")
+
+ax.set_ylabel(target_column)
+ax.set_title(f"{target_column} Prediction vs Actual on Held-Out Test Data")
 ax.legend()
 st.pyplot(fig)
+plt.close(fig)
 
-# Metrics
-mae = mean_absolute_error(actual, predictions_rescaled)
-rmse = np.sqrt(mean_squared_error(actual, predictions_rescaled))
-r2 = r2_score(actual, predictions_rescaled)
+st.caption("Top held-out metrics")
+st.write(trained_df[["Model", "MAE", "RMSE", "R2"]].head(5).reset_index(drop=True))
 
-st.write({"MAE": mae, "RMSE": rmse, "R2": r2})
 
 # ----------------------------------------
 # Future Prediction
 # ----------------------------------------
 st.subheader("📅 Future Prediction")
 
-last_date = df["Date"].iloc[-1]
-user_date = st.date_input("Select future date")
-
-if user_date > last_date.date():
-    days_ahead = (user_date - last_date.date()).days
-
-    seq = scaled_data[-SEQUENCE_LENGTH:]
-    preds = []
-
-    for _ in range(days_ahead):
-        pred = model.predict(seq.reshape(1, SEQUENCE_LENGTH, seq.shape[1]), verbose=0)
-        preds.append(pred[0][0])
-
-        new_row = seq[-1].copy()
-        new_row[target_index] = pred[0][0]
-        seq = np.vstack([seq[1:], new_row])
-
-    temp = np.zeros((len(preds), len(numeric_cols)))
-    temp[:, target_index] = preds
-
-    final = scaler.inverse_transform(temp)[:, target_index]
-    predicted_price = final[-1]
-
-    st.success(f"Predicted Price: {round(predicted_price, 2)}")
-
-    # Save to DB
-if st.session_state.logged_in and st.session_state.user:
-    supabase.table("predictions").insert({
-        "user_id": st.session_state.user.id,
-        "file_name": file_name,
-        "target_column": target_column,
-        "predicted_value": float(predicted_price),
-        "prediction_date": str(user_date)
-    }).execute()
-
+if "Date" not in df.columns or df["Date"].isna().all():
+    st.warning("Future prediction requires a usable Date column.")
 else:
-    st.warning("Select a future date.")
+    last_date = df["Date"].iloc[-1]
+    user_date = st.date_input("Select future date")
+
+    if user_date > last_date.date():
+        days_ahead = (user_date - last_date.date()).days
+
+        future_values = recursive_forecast(
+            best_candidate,
+            scaled_data,
+            target_index,
+            scaler,
+            len(numeric_cols),
+            days_ahead,
+            recent_target_values=df[target_column].to_numpy(),
+        )
+        predicted_price = float(future_values[-1])
+
+        if selected_is_best:
+            st.success(f"Best model: {selected_model_name}")
+        else:
+            st.success(f"Selected model: {selected_model_name}")
+            st.info(f"Best available model remains {best_model_name}.")
+        st.success(f"Predicted {target_column}: {round(predicted_price, 2)}")
+
+        if st.session_state.logged_in and st.session_state.user:
+            supabase.table("predictions").insert({
+                "user_id": st.session_state.user.id,
+                "file_name": file_name,
+                "target_column": target_column,
+                "predicted_value": float(predicted_price),
+                "prediction_date": str(user_date)
+            }).execute()
+    else:
+        st.warning("Select a future date.")
