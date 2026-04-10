@@ -30,7 +30,7 @@ SUPABASE_KEY = read_secret("SUPABASE_KEY", DEFAULT_SUPABASE_KEY)
 SUPABASE_SERVICE_ROLE_KEY = read_secret("SUPABASE_SERVICE_ROLE_KEY", "")
 EMAIL_ADDRESS = read_secret("EMAIL_ADDRESS", "")
 EMAIL_APP_PASSWORD = read_secret("EMAIL_APP_PASSWORD", "")
-MAIN_APP_URL = read_secret("MAIN_APP_URL", "http://localhost:8501")
+MAIN_APP_URL = read_secret("MAIN_APP_URL", "https://stock-app-v5-yjcge5kowmrfldftuyjk4g.streamlit.app/")
 
 if "reset_step" not in st.session_state:
     st.session_state.reset_step = "request"
