@@ -32,7 +32,7 @@ SUPABASE_SERVICE_ROLE_KEY = (
     or read_secret("SUPABASE_SERVICE_ROLE_KEY", "")
     or read_secret("SUPABASE_SECRET_KEY", "")
 )
-MAIN_APP_URL = os.getenv("MAIN_APP_URL") or read_secret("MAIN_APP_URL", "http://localhost:8501")
+MAIN_APP_URL = os.getenv("MAIN_APP_URL") or read_secret("MAIN_APP_URL", "https://stock-app-v5-yjcge5kowmrfldftuyjk4g.streamlit.app/")
 
 supabase: Client | None = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 supabase_admin: Client | None = (
