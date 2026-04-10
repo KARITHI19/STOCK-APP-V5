@@ -51,7 +51,7 @@ MODEL_STORAGE_BUCKET = get_secret_value("SUPABASE_MODEL_BUCKET", "model-suites")
 MODEL_STORAGE_PREFIX = get_secret_value("MODEL_STORAGE_PREFIX", "saved_suites")
 MAIN_APP_URL = get_secret_value("MAIN_APP_URL", "http://localhost:8501")
 RESET_APP_URL = get_secret_value("RESET_APP_URL", "http://localhost:8502")
-ADMIN_PANEL_URL = get_secret_value("ADMIN_PANEL_URL", "http://localhost:8503")
+ADMIN_PANEL_URL = get_secret_value("ADMIN_PANEL_URL", "https://stock-app-v5-ekjlrgbrp3zelhxcuxgrzv.streamlit.app/")
 
 
 @st.cache_resource(show_spinner=False)
