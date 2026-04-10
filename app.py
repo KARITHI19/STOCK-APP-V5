@@ -46,6 +46,9 @@ def get_secret_value(key, default=""):
 
 SUPABASE_URL = get_secret_value("SUPABASE_URL", DEFAULT_SUPABASE_URL)
 SUPABASE_KEY = get_secret_value("SUPABASE_KEY", "")
+SUPABASE_SERVICE_ROLE_KEY = get_secret_value("SUPABASE_SERVICE_ROLE_KEY", "") or get_secret_value("SUPABASE_SECRET_KEY", "")
+MODEL_STORAGE_BUCKET = get_secret_value("SUPABASE_MODEL_BUCKET", "model-suites")
+MODEL_STORAGE_PREFIX = get_secret_value("MODEL_STORAGE_PREFIX", "saved_suites")
 MAIN_APP_URL = get_secret_value("MAIN_APP_URL", "http://localhost:8501")
 RESET_APP_URL = get_secret_value("RESET_APP_URL", "http://localhost:8502")
 ADMIN_PANEL_URL = get_secret_value("ADMIN_PANEL_URL", "http://localhost:8503")
@@ -58,6 +61,17 @@ def get_supabase_client():
 
     try:
         return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def get_supabase_admin_client():
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return None
+
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     except Exception:
         return None
 
@@ -185,6 +199,97 @@ def get_suite_meta_path(suite_key):
     return os.path.join(get_suite_dir(suite_key), "suite_meta.joblib")
 
 
+def get_suite_storage_prefix(suite_key):
+    suite_hash = hashlib.md5(suite_key.encode("utf-8")).hexdigest()
+    return f"{MODEL_STORAGE_PREFIX}/{suite_hash}"
+
+
+def ensure_model_storage_bucket():
+    admin_client = get_supabase_admin_client()
+    if admin_client is None:
+        return False
+
+    try:
+        admin_client.storage.get_bucket(MODEL_STORAGE_BUCKET)
+        return True
+    except Exception:
+        try:
+            admin_client.storage.create_bucket(
+                MODEL_STORAGE_BUCKET,
+                options={"public": False},
+            )
+            return True
+        except Exception:
+            return False
+
+
+def sync_suite_to_storage(suite_key):
+    admin_client = get_supabase_admin_client()
+    if admin_client is None or not ensure_model_storage_bucket():
+        return False
+
+    suite_dir = get_suite_dir(suite_key)
+    if not os.path.isdir(suite_dir):
+        return False
+
+    bucket = admin_client.storage.from_(MODEL_STORAGE_BUCKET)
+    remote_prefix = get_suite_storage_prefix(suite_key)
+
+    try:
+        for entry in os.listdir(suite_dir):
+            local_path = os.path.join(suite_dir, entry)
+            if not os.path.isfile(local_path):
+                continue
+
+            bucket.upload(
+                f"{remote_prefix}/{entry}",
+                local_path,
+                {"content-type": "application/octet-stream", "upsert": "true"},
+            )
+        return True
+    except Exception:
+        return False
+
+
+def restore_suite_from_storage(suite_key):
+    admin_client = get_supabase_admin_client()
+    if admin_client is None or not ensure_model_storage_bucket():
+        return False
+
+    remote_prefix = get_suite_storage_prefix(suite_key)
+    bucket = admin_client.storage.from_(MODEL_STORAGE_BUCKET)
+
+    try:
+        objects = bucket.list(remote_prefix)
+    except Exception:
+        return False
+
+    if not objects:
+        return False
+
+    suite_dir = get_suite_dir(suite_key)
+    os.makedirs(suite_dir, exist_ok=True)
+
+    restored_any = False
+    for item in objects:
+        file_name = item.get("name")
+        if not file_name:
+            continue
+
+        remote_path = f"{remote_prefix}/{file_name}"
+        local_path = os.path.join(suite_dir, file_name)
+
+        try:
+            payload = bucket.download(remote_path)
+            with open(local_path, "wb") as output_file:
+                output_file.write(payload)
+            restored_any = True
+        except Exception:
+            continue
+
+    return restored_any
+
+
 def save_candidate_artifact(candidate, suite_dir):
     model_name = candidate["name"]
     kind = candidate["kind"]
@@ -239,10 +344,19 @@ def save_model_suite(suite_key, leaderboard_df, best_model_name, candidate_model
         "models": saved_models,
     }
     joblib.dump(payload, get_suite_meta_path(suite_key))
+    sync_suite_to_storage(suite_key)
 
 
 def load_model_suite(suite_key):
     meta_path = get_suite_meta_path(suite_key)
+    suite_source = "saved"
+    if not os.path.exists(meta_path):
+        restored = restore_suite_from_storage(suite_key)
+        if restored:
+            suite_source = "cloud"
+        if not os.path.exists(meta_path):
+            return None
+
     if not os.path.exists(meta_path):
         return None
 
@@ -285,6 +399,7 @@ def load_model_suite(suite_key):
             "best_model_name": payload["best_model_name"],
             "leaderboard": pd.DataFrame(payload.get("leaderboard", [])),
             "models": models,
+            "source": suite_source,
         }
     except Exception:
         return None
@@ -1007,9 +1122,11 @@ cached_suite = st.session_state.get("model_suite")
 if not cached_suite or cached_suite.get("key") != suite_key:
     cached_suite = load_model_suite(suite_key)
     if cached_suite:
-        cached_suite["source"] = "saved"
         st.session_state.model_suite = cached_suite
-        st.info("Loaded saved model suite for this dataset and target column.")
+        if cached_suite.get("source") == "cloud":
+            st.info("Loaded saved model suite from Supabase Storage for this dataset and target column.")
+        else:
+            st.info("Loaded saved model suite for this dataset and target column.")
 
 if not cached_suite or cached_suite.get("key") != suite_key:
     candidate_rows = []
@@ -1173,6 +1290,8 @@ selected_is_best = selected_model_name == best_model_name
 
 if model_suite.get("source") == "saved":
     st.caption("Using saved model artifacts from disk for this dataset and target column.")
+elif model_suite.get("source") == "cloud":
+    st.caption("Using saved model artifacts restored from Supabase Storage for this dataset and target column.")
 else:
     st.caption("Using freshly trained model artifacts for this dataset and target column.")
 
