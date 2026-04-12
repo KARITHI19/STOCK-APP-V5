@@ -192,6 +192,37 @@ def find_user_by_email(users: list[Any], email: str):
     return None
 
 
+def validate_password_strength(password: str) -> str | None:
+    if len(password) < 8:
+        return "Password must be at least 8 characters."
+    if not any(char.isupper() for char in password):
+        return "Password must include at least one uppercase letter."
+    if not any(char.islower() for char in password):
+        return "Password must include at least one lowercase letter."
+    if not any(char.isdigit() for char in password):
+        return "Password must include at least one number."
+    if not any(not char.isalnum() for char in password):
+        return "Password must include at least one special character."
+    return None
+
+
+def supports_prediction_metadata_columns() -> bool:
+    cache_key = "admin_supports_prediction_metadata_columns"
+    if cache_key in st.session_state:
+        return bool(st.session_state[cache_key])
+
+    supported = False
+    if supabase_admin is not None:
+        try:
+            supabase_admin.table("predictions").select("prediction_direction, model_used").limit(1).execute()
+            supported = True
+        except Exception:
+            supported = False
+
+    st.session_state[cache_key] = supported
+    return supported
+
+
 def format_time(value: Any) -> str:
     if not value:
         return "N/A"
@@ -313,13 +344,22 @@ def update_user_disabled_state(target_user: Any, disabled: bool):
 
 def load_recent_predictions() -> list[dict[str, Any]]:
     try:
-        response = (
-            supabase_admin.table("predictions")
-            .select("user_id, file_name, prediction_date, predicted_value, created_at")
-            .order("created_at", desc=True)
-            .limit(25)
-            .execute()
-        )
+        if supports_prediction_metadata_columns():
+            response = (
+                supabase_admin.table("predictions")
+                .select("user_id, file_name, target_column, prediction_date, predicted_value, prediction_direction, model_used, created_at")
+                .order("created_at", desc=True)
+                .limit(25)
+                .execute()
+            )
+        else:
+            response = (
+                supabase_admin.table("predictions")
+                .select("user_id, file_name, target_column, prediction_date, predicted_value, created_at")
+                .order("created_at", desc=True)
+                .limit(25)
+                .execute()
+            )
         return response.data or []
     except Exception:
         return []
@@ -338,14 +378,29 @@ def build_prediction_frame(predictions: list[dict[str, Any]], users: list[Any]) 
                 "user_id": item.get("user_id", ""),
                 "email": email_lookup.get(item.get("user_id"), "Unknown user"),
                 "file_name": item.get("file_name", "N/A"),
+                "target_column": item.get("target_column", "N/A"),
                 "prediction_date": item.get("prediction_date", "N/A"),
                 "predicted_value": item.get("predicted_value", 0),
+                "prediction_direction": item.get("prediction_direction", "N/A"),
+                "model_used": item.get("model_used", "N/A"),
                 "created_at": created_at,
             }
         )
 
     if not rows:
-        return pd.DataFrame(columns=["user_id", "email", "file_name", "prediction_date", "predicted_value", "created_at"])
+        return pd.DataFrame(
+            columns=[
+                "user_id",
+                "email",
+                "file_name",
+                "target_column",
+                "prediction_date",
+                "predicted_value",
+                "prediction_direction",
+                "model_used",
+                "created_at",
+            ]
+        )
 
     frame = pd.DataFrame(rows)
     return frame.sort_values(by="created_at", ascending=False).reset_index(drop=True)
@@ -463,12 +518,13 @@ def admin_screen():
 
         if create_btn:
             email = email.strip().lower()
+            password_error = validate_password_strength(password)
             if not first_name.strip() or not last_name.strip():
                 st.error("Enter first and last name.")
             elif not email:
                 st.error("Enter an email.")
-            elif len(password) < 6:
-                st.error("Password must be at least 6 characters.")
+            elif password_error:
+                st.error(password_error)
             elif find_user_by_email(users, email):
                 st.error("A user with that email already exists.")
             else:

@@ -25,7 +25,7 @@ from supabase import create_client, Client
 # ----------------------------------------
 DEFAULT_SUPABASE_URL = "https://bqumqfdisvihzknhaaej.supabase.co"
 MODEL_SUITES_DIR = os.path.join("models", "saved_suites")
-MODEL_SUITE_VERSION = "v6"
+MODEL_SUITE_VERSION = "v7"
 SEQUENCE_LENGTH = 60
 
 
@@ -114,6 +114,75 @@ def is_admin_user(user) -> bool:
     return str(app_metadata.get("role", "")).strip().lower() == "admin"
 
 
+def normalize_users(response):
+    if response is None:
+        return []
+    if isinstance(response, list):
+        return response
+    users = get_nested_value(response, "users")
+    if isinstance(users, list):
+        return users
+    try:
+        return list(response)
+    except TypeError:
+        return []
+
+
+def list_auth_users():
+    admin_client = get_supabase_admin_client()
+    if admin_client is None:
+        return []
+
+    try:
+        return normalize_users(admin_client.auth.admin.list_users())
+    except TypeError:
+        return normalize_users(admin_client.auth.admin.list_users(page=1, per_page=200))
+    except Exception:
+        return []
+
+
+def email_exists_in_auth(email: str) -> bool:
+    target = email.strip().lower()
+    if not target:
+        return False
+    for user in list_auth_users():
+        current_email = str(get_nested_value(user, "email", "") or "").strip().lower()
+        if current_email == target:
+            return True
+    return False
+
+
+def validate_password_strength(password: str) -> str | None:
+    if len(password) < 8:
+        return "Password must be at least 8 characters."
+    if not re.search(r"[A-Z]", password):
+        return "Password must include at least one uppercase letter."
+    if not re.search(r"[a-z]", password):
+        return "Password must include at least one lowercase letter."
+    if not re.search(r"\d", password):
+        return "Password must include at least one number."
+    if not re.search(r"[^A-Za-z0-9]", password):
+        return "Password must include at least one special character."
+    return None
+
+
+def supports_prediction_metadata_columns() -> bool:
+    cache_key = "supports_prediction_metadata_columns"
+    if cache_key in st.session_state:
+        return bool(st.session_state[cache_key])
+
+    supported = False
+    if supabase is not None:
+        try:
+            supabase.table("predictions").select("prediction_direction, model_used").limit(1).execute()
+            supported = True
+        except Exception:
+            supported = False
+
+    st.session_state[cache_key] = supported
+    return supported
+
+
 def clean_uploaded_dataframe(df: pd.DataFrame):
     cleaned_df = df.copy()
     cleaned_df.columns = [str(col).strip() for col in cleaned_df.columns]
@@ -154,6 +223,75 @@ def clean_uploaded_dataframe(df: pd.DataFrame):
     return cleaned_df
 
 
+def build_technical_indicator_features(
+    df: pd.DataFrame,
+    target_column: str,
+    include_ma10: bool,
+    include_ma20: bool,
+    include_ma50: bool,
+    include_ema10: bool,
+    include_ema20: bool,
+    include_rsi: bool,
+    include_macd: bool,
+):
+    featured_df = df.copy()
+    feature_columns = [target_column]
+    selected_indicator_labels = []
+    selected_indicator_keys = []
+
+    if include_ma10:
+        featured_df["MA_10"] = featured_df[target_column].rolling(window=10, min_periods=10).mean()
+        feature_columns.append("MA_10")
+        selected_indicator_labels.append("MA10")
+        selected_indicator_keys.append("ma10")
+
+    if include_ma20:
+        featured_df["MA_20"] = featured_df[target_column].rolling(window=20, min_periods=20).mean()
+        feature_columns.append("MA_20")
+        selected_indicator_labels.append("MA20")
+        selected_indicator_keys.append("ma20")
+
+    if include_ma50:
+        featured_df["MA_50"] = featured_df[target_column].rolling(window=50, min_periods=50).mean()
+        feature_columns.append("MA_50")
+        selected_indicator_labels.append("MA50")
+        selected_indicator_keys.append("ma50")
+
+    if include_ema10:
+        featured_df["EMA_10"] = featured_df[target_column].ewm(span=10, adjust=False).mean()
+        feature_columns.append("EMA_10")
+        selected_indicator_labels.append("EMA10")
+        selected_indicator_keys.append("ema10")
+
+    if include_ema20:
+        featured_df["EMA_20"] = featured_df[target_column].ewm(span=20, adjust=False).mean()
+        feature_columns.append("EMA_20")
+        selected_indicator_labels.append("EMA20")
+        selected_indicator_keys.append("ema20")
+
+    if include_rsi:
+        delta = featured_df[target_column].diff()
+        gains = delta.clip(lower=0)
+        losses = -delta.clip(upper=0)
+        avg_gain = gains.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+        avg_loss = losses.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        featured_df["RSI_14"] = (100 - (100 / (1 + rs))).fillna(50.0)
+        feature_columns.append("RSI_14")
+        selected_indicator_labels.append("RSI")
+        selected_indicator_keys.append("rsi14")
+
+    if include_macd:
+        ema_fast = featured_df[target_column].ewm(span=12, adjust=False).mean()
+        ema_slow = featured_df[target_column].ewm(span=26, adjust=False).mean()
+        featured_df["MACD_12_26"] = ema_fast - ema_slow
+        feature_columns.append("MACD_12_26")
+        selected_indicator_labels.append("MACD")
+        selected_indicator_keys.append("macd12_26")
+
+    return featured_df, feature_columns, selected_indicator_labels, selected_indicator_keys
+
+
 def build_dataset_signature(df: pd.DataFrame, feature_names, target_column):
     signature_columns = list(feature_names)
     if "Date" in df.columns:
@@ -169,20 +307,43 @@ def build_dataset_signature(df: pd.DataFrame, feature_names, target_column):
     return hashlib.md5(payload).hexdigest()
 
 
-def build_sequences(data, sequence_length, target_index):
+def build_sequences(feature_data, target_data, sequence_length):
     X, y = [], []
 
-    for i in range(sequence_length, len(data)):
-        X.append(data[i-sequence_length:i])
-        y.append(data[i, target_index])
+    for i in range(sequence_length, len(feature_data)):
+        X.append(feature_data[i-sequence_length:i])
+        y.append(target_data[i])
 
     return np.array(X), np.array(y)
 
 
-def inverse_target_values(scaled_values, scaler, feature_count, target_index):
-    temp = np.zeros((len(scaled_values), feature_count))
-    temp[:, target_index] = np.asarray(scaled_values).reshape(-1)
-    return scaler.inverse_transform(temp)[:, target_index]
+def inverse_target_values(scaled_values, target_scaler):
+    values = np.asarray(scaled_values).reshape(-1, 1)
+    return target_scaler.inverse_transform(values).reshape(-1)
+
+
+def compute_direction_metrics(actual_values, predicted_values, reference_start):
+    actual_values = np.asarray(actual_values).reshape(-1)
+    predicted_values = np.asarray(predicted_values).reshape(-1)
+    if len(actual_values) == 0 or len(predicted_values) == 0 or len(actual_values) != len(predicted_values):
+        return {"Direction Accuracy": np.nan, "Up Precision": np.nan, "Down Precision": np.nan}
+
+    prev_actual = np.concatenate([[reference_start], actual_values[:-1]])
+    actual_up = actual_values >= prev_actual
+    pred_up = predicted_values >= prev_actual
+
+    direction_accuracy = float(np.mean(actual_up == pred_up))
+
+    up_mask = pred_up
+    down_mask = ~pred_up
+    up_precision = float(np.mean(actual_up[up_mask])) if np.any(up_mask) else np.nan
+    down_precision = float(np.mean((~actual_up)[down_mask])) if np.any(down_mask) else np.nan
+
+    return {
+        "Direction Accuracy": direction_accuracy,
+        "Up Precision": up_precision,
+        "Down Precision": down_precision,
+    }
 
 
 def slugify_name(value):
@@ -322,7 +483,16 @@ def load_candidate_artifact(record):
     return joblib.load(artifact_path)
 
 
-def save_model_suite(suite_key, leaderboard_df, best_model_name, candidate_models):
+def save_model_suite(
+    suite_key,
+    leaderboard_df,
+    best_model_name,
+    candidate_models,
+    feature_columns,
+    target_column,
+    feature_scaler,
+    target_scaler,
+):
     suite_dir = get_suite_dir(suite_key)
     os.makedirs(suite_dir, exist_ok=True)
 
@@ -342,6 +512,10 @@ def save_model_suite(suite_key, leaderboard_df, best_model_name, candidate_model
         "best_model_name": best_model_name,
         "leaderboard": leaderboard_df.to_dict(orient="records"),
         "models": saved_models,
+        "feature_columns": list(feature_columns),
+        "target_column": target_column,
+        "feature_scaler": feature_scaler,
+        "target_scaler": target_scaler,
     }
     joblib.dump(payload, get_suite_meta_path(suite_key))
     sync_suite_to_storage(suite_key)
@@ -400,6 +574,10 @@ def load_model_suite(suite_key):
             "leaderboard": pd.DataFrame(payload.get("leaderboard", [])),
             "models": models,
             "source": suite_source,
+            "feature_columns": payload.get("feature_columns", []),
+            "target_column": payload.get("target_column"),
+            "feature_scaler": payload.get("feature_scaler"),
+            "target_scaler": payload.get("target_scaler"),
         }
     except Exception:
         return None
@@ -502,31 +680,6 @@ def build_bilstm_model(input_shape):
     return model
 
 
-def build_transformer_model(input_shape):
-    inputs = tf.keras.layers.Input(shape=input_shape)
-    x = tf.keras.layers.LayerNormalization()(inputs)
-    attention = tf.keras.layers.MultiHeadAttention(
-        num_heads=4,
-        key_dim=max(8, input_shape[-1]),
-        dropout=0.1,
-    )(x, x)
-    x = tf.keras.layers.Add()([inputs, attention])
-    y = tf.keras.layers.LayerNormalization()(x)
-    y = tf.keras.layers.Dense(64, activation="relu")(y)
-    y = tf.keras.layers.Dense(input_shape[-1])(y)
-    y = tf.keras.layers.Dropout(0.1)(y)
-    x = tf.keras.layers.Add()([x, y])
-    x = tf.keras.layers.GlobalAveragePooling1D()(x)
-    x = tf.keras.layers.Dense(32, activation="relu")(x)
-    outputs = tf.keras.layers.Dense(1)(x)
-    model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-        loss=tf.keras.losses.Huber(),
-    )
-    return model
-
-
 def train_sequence_model(name, builder, X_train, y_train, X_test, note):
     tf.keras.backend.clear_session()
     tf.keras.utils.set_random_seed(42)
@@ -613,7 +766,15 @@ def train_tuned_tabular_model(name, configs, X_train_flat, y_train, X_test_flat)
     }
 
 
-def recursive_forecast(candidate, scaled_data, target_index, scaler, feature_count, days_ahead, recent_target_values=None):
+def recursive_forecast(
+    candidate,
+    scaled_feature_data,
+    feature_columns,
+    target_column,
+    target_scaler,
+    days_ahead,
+    recent_target_values=None,
+):
     if candidate["kind"] == "baseline":
         last_value = float(recent_target_values[-1])
         return np.repeat(last_value, days_ahead)
@@ -621,7 +782,8 @@ def recursive_forecast(candidate, scaled_data, target_index, scaler, feature_cou
     if candidate["kind"] == "stat":
         return np.asarray(candidate["model"].forecast(steps=days_ahead)).reshape(-1)
 
-    seq = scaled_data[-SEQUENCE_LENGTH:].copy()
+    target_index = feature_columns.index(target_column)
+    seq = scaled_feature_data[-SEQUENCE_LENGTH:].copy()
     preds_scaled = []
 
     for _ in range(days_ahead):
@@ -636,7 +798,7 @@ def recursive_forecast(candidate, scaled_data, target_index, scaler, feature_cou
         new_row[target_index] = pred_value
         seq = np.vstack([seq[1:], new_row])
 
-    return inverse_target_values(preds_scaled, scaler, feature_count, target_index)
+    return inverse_target_values(preds_scaled, target_scaler)
 
 
 def inject_custom_styles():
@@ -893,15 +1055,18 @@ if not st.session_state.logged_in:
                 last_name = last_name.strip()
                 email = email.strip().lower()
                 confirm_email = confirm_email.strip().lower()
+                password_error = validate_password_strength(password)
 
                 if not first_name or not last_name:
                     st.sidebar.error("Enter your first and last name.")
                 elif email != confirm_email:
                     st.sidebar.error("Emails do not match ❌")
-                elif len(password) < 6:
-                    st.sidebar.error("Password must be at least 6 characters.")
+                elif password_error:
+                    st.sidebar.error(password_error)
                 elif password != confirm_password:
                     st.sidebar.error("Passwords do not match ❌")
+                elif email_exists_in_auth(email):
+                    st.sidebar.error("This email is already registered. Please login.")
                 else:
                     try:
                         res = supabase.auth.sign_up({
@@ -915,10 +1080,22 @@ if not st.session_state.logged_in:
                                 }
                             },
                         })
-                        if res.user:
-                            st.sidebar.success("Registration successful ✅")
+                        response = supabase.functions.invoke(
+                        "hyper-task",
+                        invoke_options={"body": {"name": "Functions"}}
+                    )
+                        if res.user and not res.session:
+                            st.sidebar.success("Confirm your email and login.")
+                        elif res.user and res.session:
+                            st.sidebar.success("Account created successfully.")
+                        else:
+                            st.sidebar.error("Registration failed. Please try again.")
                     except Exception as e:
-                        st.sidebar.error(f"Error: {e}")
+                        error_text = str(e).lower()
+                        if "already registered" in error_text or "already exists" in error_text:
+                            st.sidebar.error("This email is already registered. Please login.")
+                        else:
+                            st.sidebar.error(f"Error: {e}")
 
     with reset_tab:
         st.caption("Open the secure password reset page to reset your password with an email OTP.")
@@ -969,12 +1146,20 @@ else:
     st.sidebar.subheader("📜 Prediction History")
 
     try:
-        res = supabase.table("predictions") \
-            .select("file_name, prediction_date, predicted_value, created_at") \
-            .eq("user_id", user.id) \
-            .order("created_at", desc=True) \
-            .limit(5) \
-            .execute()
+        if supports_prediction_metadata_columns():
+            res = supabase.table("predictions") \
+                .select("file_name, target_column, prediction_date, predicted_value, prediction_direction, model_used, created_at") \
+                .eq("user_id", user.id) \
+                .order("created_at", desc=True) \
+                .limit(5) \
+                .execute()
+        else:
+            res = supabase.table("predictions") \
+                .select("file_name, target_column, prediction_date, predicted_value, created_at") \
+                .eq("user_id", user.id) \
+                .order("created_at", desc=True) \
+                .limit(5) \
+                .execute()
 
         history = res.data
 
@@ -986,8 +1171,11 @@ else:
 
                 st.sidebar.markdown(f"""
 📁 **File:** {item.get('file_name', 'N/A')}  
+🎯 **Target:** {item.get('target_column', 'N/A')}  
 📅 **Date:** {item.get('prediction_date', 'N/A')}  
 💰 **Price:** {round(price, 2)}  
+📈 **Direction:** {item.get('prediction_direction', 'N/A')}  
+🧠 **Model:** {item.get('model_used', 'N/A')}  
 ⏱ **Time(UTC):** {str(item.get('created_at', ''))[:19].replace("T"," ")}
 
 ---
@@ -1046,31 +1234,58 @@ render_data_inspection(df)
 if "Date" in df.columns:
     df = df.sort_values("Date")
 
-# EMA Features
-if "Close" in df.columns:
-    close_series = pd.to_numeric(df["Close"], errors="coerce")
-    df["EMA20"] = close_series.ewm(span=20).mean()
-    df["EMA50"] = close_series.ewm(span=50).mean()
-    df["SMA10"] = close_series.rolling(window=10).mean()
-    df["SMA20"] = close_series.rolling(window=20).mean()
-    df["CloseLag1"] = close_series.shift(1)
-    df["CloseLag5"] = close_series.shift(5)
-    df["Return1"] = close_series.pct_change()
-    df["Return5"] = close_series.pct_change(periods=5)
-    df["Volatility10"] = df["Return1"].rolling(window=10).std()
-
 # Numeric columns
 numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 if not numeric_cols:
     st.error("This CSV does not contain numeric columns the stock model can train on. Please upload market data with columns like Date, Open, High, Low, Close, or Volume.")
     st.stop()
 
-df[numeric_cols] = df[numeric_cols].ffill().bfill()
-
-target_column = st.selectbox("Target Column", numeric_cols)
-if not target_column:
-    st.error("No numeric target column is available in this file.")
+target_priority = ["Close", "High", "Open", "Low"]
+present_targets = {str(col).strip().lower(): col for col in numeric_cols}
+price_targets = [present_targets[name.lower()] for name in target_priority if name.lower() in present_targets]
+if not price_targets:
+    st.error("Target columns must be one of Open, High, Low, or Close.")
     st.stop()
+
+target_column = st.selectbox("Target Column (OHLC)", price_targets)
+if not target_column:
+    st.error("No valid OHLC target column is available in this file.")
+    st.stop()
+
+# Feature engineering selector
+st.markdown("### Feature Engineering")
+st.caption("Choose technical indicators to include with the target feature.")
+trend_col, momentum_col = st.columns(2)
+with trend_col:
+    st.markdown("**Trend**")
+    use_ma10 = st.checkbox("MA 10", value=False)
+    use_ma20 = st.checkbox("MA 20", value=False)
+    use_ma50 = st.checkbox("MA 50", value=False)
+    use_ema10 = st.checkbox("EMA 10", value=False)
+    use_ema20 = st.checkbox("EMA 20", value=False)
+with momentum_col:
+    st.markdown("**Momentum**")
+    use_rsi = st.checkbox("RSI", value=False)
+    use_macd = st.checkbox("MACD", value=False)
+
+df, feature_columns, selected_indicator_labels, selected_indicator_keys = build_technical_indicator_features(
+    df,
+    target_column,
+    include_ma10=use_ma10,
+    include_ma20=use_ma20,
+    include_ma50=use_ma50,
+    include_ema10=use_ema10,
+    include_ema20=use_ema20,
+    include_rsi=use_rsi,
+    include_macd=use_macd,
+)
+
+if selected_indicator_labels:
+    feature_mode_label = f"target + {', '.join(selected_indicator_labels)}"
+    feature_mode_key = f"target_plus_{'_'.join(selected_indicator_keys)}"
+else:
+    feature_mode_label = "target-only"
+    feature_mode_key = "target_only"
 
 # Time-aware train/test split
 split_index = max(int(len(df) * 0.8), SEQUENCE_LENGTH + 1)
@@ -1083,19 +1298,53 @@ if len(train_df) <= SEQUENCE_LENGTH or len(test_df) == 0:
     st.error(f"This dataset needs enough rows to create training and test data beyond the {SEQUENCE_LENGTH}-row sequence window.")
     st.stop()
 
-target_index = numeric_cols.index(target_column)
-dataset_signature = build_dataset_signature(df, numeric_cols, target_column)
+columns_to_fill = list(dict.fromkeys(feature_columns + [target_column]))
+df[columns_to_fill] = df[columns_to_fill].ffill().bfill()
 
-# Scaling
-scaler = MinMaxScaler()
-train_scaled = scaler.fit_transform(train_df[numeric_cols])
-scaled_data = scaler.transform(df[numeric_cols])
+if df[columns_to_fill].isna().any().any():
+    st.error("Feature engineering produced unresolved missing values. Please upload cleaner OHLC data.")
+    st.stop()
 
-X_train, y_train = build_sequences(train_scaled, SEQUENCE_LENGTH, target_index)
+suite_key = f"{MODEL_SUITE_VERSION}|target={target_column.lower()}|feature={feature_mode_key}|seq={SEQUENCE_LENGTH}"
+cached_suite = st.session_state.get("model_suite")
+
+if not cached_suite or cached_suite.get("key") != suite_key:
+    cached_suite = load_model_suite(suite_key)
+    if cached_suite:
+        st.session_state.model_suite = cached_suite
+        if cached_suite.get("source") == "cloud":
+            st.info("Loaded saved model suite from Supabase Storage (reused without retraining).")
+        else:
+            st.info("Loaded saved model suite from disk (reused without retraining).")
+
+if cached_suite:
+    if (
+        cached_suite.get("target_column") != target_column
+        or list(cached_suite.get("feature_columns", [])) != feature_columns
+        or cached_suite.get("feature_scaler") is None
+        or cached_suite.get("target_scaler") is None
+    ):
+        cached_suite = None
+
+if cached_suite:
+    feature_scaler = cached_suite["feature_scaler"]
+    target_scaler = cached_suite["target_scaler"]
+else:
+    feature_scaler = MinMaxScaler()
+    target_scaler = MinMaxScaler()
+    feature_scaler.fit(train_df[feature_columns])
+    target_scaler.fit(train_df[[target_column]])
+
+scaled_feature_data = feature_scaler.transform(df[feature_columns])
+train_features_scaled = feature_scaler.transform(train_df[feature_columns])
+train_target_scaled = target_scaler.transform(train_df[[target_column]]).reshape(-1)
+
+X_train, y_train = build_sequences(train_features_scaled, train_target_scaled, SEQUENCE_LENGTH)
 
 test_window_df = df.iloc[split_index - SEQUENCE_LENGTH:].copy()
-test_scaled = scaler.transform(test_window_df[numeric_cols])
-X_test, y_test = build_sequences(test_scaled, SEQUENCE_LENGTH, target_index)
+test_features_scaled = feature_scaler.transform(test_window_df[feature_columns])
+test_target_scaled = target_scaler.transform(test_window_df[[target_column]]).reshape(-1)
+X_test, y_test = build_sequences(test_features_scaled, test_target_scaled, SEQUENCE_LENGTH)
 
 if len(X_train) == 0 or len(y_train) == 0:
     st.error(f"This dataset needs more than {SEQUENCE_LENGTH} usable rows in the training split after cleaning.")
@@ -1106,34 +1355,32 @@ if len(X_test) == 0 or len(y_test) == 0:
     st.stop()
 
 actual = test_window_df[target_column].iloc[SEQUENCE_LENGTH:].to_numpy()
+target_index = feature_columns.index(target_column)
 
 if "Date" in test_window_df.columns and test_window_df["Date"].notna().any():
     prediction_dates = test_window_df["Date"].iloc[SEQUENCE_LENGTH:].reset_index(drop=True)
 else:
     prediction_dates = None
 
+st.caption(f"Feature Mode: {feature_mode_label}")
 
 # ----------------------------------------
 # Model
 # ----------------------------------------
-suite_key = f"{MODEL_SUITE_VERSION}|{dataset_signature}|{split_index}|{SEQUENCE_LENGTH}"
-cached_suite = st.session_state.get("model_suite")
+needs_training_for_suite = not cached_suite or cached_suite.get("key") != suite_key
+if needs_training_for_suite:
+    st.warning(f"No saved models found for this target in {feature_mode_label} mode.")
+    train_for_target = st.button("Train And Save Models")
+    if not train_for_target:
+        st.info("Saved-model mode is active. Select another target with saved models, or click the button to train once.")
+        st.stop()
 
-if not cached_suite or cached_suite.get("key") != suite_key:
-    cached_suite = load_model_suite(suite_key)
-    if cached_suite:
-        st.session_state.model_suite = cached_suite
-        if cached_suite.get("source") == "cloud":
-            st.info("Loaded saved model suite from Supabase Storage for this dataset and target column.")
-        else:
-            st.info("Loaded saved model suite for this dataset and target column.")
-
-if not cached_suite or cached_suite.get("key") != suite_key:
+if needs_training_for_suite:
     candidate_rows = []
     candidate_models = {}
     X_train_flat = X_train.reshape(len(X_train), -1)
     X_test_flat = X_test.reshape(len(X_test), -1)
-    baseline_predictions = inverse_target_values(X_test[:, -1, target_index], scaler, len(numeric_cols), target_index)
+    baseline_predictions = inverse_target_values(X_test[:, -1, target_index], target_scaler)
 
     with st.spinner("Training and comparing models on held-out data..."):
         baseline_metrics = evaluate_predictions(actual, baseline_predictions)
@@ -1191,12 +1438,7 @@ if not cached_suite or cached_suite.get("key") != suite_key:
         for model_name, configs in tabular_candidates:
             try:
                 trained = train_tuned_tabular_model(model_name, configs, X_train_flat, y_train, X_test_flat)
-                predictions_actual = inverse_target_values(
-                    trained["predictions"],
-                    scaler,
-                    len(numeric_cols),
-                    target_index,
-                )
+                predictions_actual = inverse_target_values(trained["predictions"], target_scaler)
                 metrics = evaluate_predictions(actual, predictions_actual)
                 candidate_rows.append({
                     "Model": model_name,
@@ -1220,18 +1462,12 @@ if not cached_suite or cached_suite.get("key") != suite_key:
             ("LSTM", build_lstm_model, "Stacked LSTM tuned for temporal memory with dropout to curb overfitting."),
             ("GRU", build_gru_model, "GRU sequence model with lighter recurrent capacity for faster generalization."),
             ("BiLSTM", build_bilstm_model, "Bidirectional LSTM for richer context, regularized with dropout and early stopping."),
-            ("Transformer", build_transformer_model, "Transformer encoder with attention, residual connections, and early stopping."),
         ]
 
         for model_name, builder, note in sequence_candidates:
             try:
                 trained = train_sequence_model(model_name, builder, X_train, y_train, X_test, note)
-                predictions_actual = inverse_target_values(
-                    trained["predictions"],
-                    scaler,
-                    len(numeric_cols),
-                    target_index,
-                )
+                predictions_actual = inverse_target_values(trained["predictions"], target_scaler)
                 metrics = evaluate_predictions(actual, predictions_actual)
                 candidate_rows.append({
                     "Model": model_name,
@@ -1259,19 +1495,78 @@ if not cached_suite or cached_suite.get("key") != suite_key:
         st.stop()
 
     best_model_name = get_best_model_name(leaderboard_df)
-    save_model_suite(suite_key, leaderboard_df, best_model_name, candidate_models)
+    save_model_suite(
+        suite_key,
+        leaderboard_df,
+        best_model_name,
+        candidate_models,
+        feature_columns,
+        target_column,
+        feature_scaler,
+        target_scaler,
+    )
     st.session_state.model_suite = {
         "key": suite_key,
         "leaderboard": leaderboard_df,
         "best_model_name": best_model_name,
         "models": candidate_models,
         "source": "trained",
+        "feature_columns": feature_columns,
+        "target_column": target_column,
+        "feature_scaler": feature_scaler,
+        "target_scaler": target_scaler,
     }
 
 model_suite = st.session_state.model_suite
-leaderboard_df = model_suite["leaderboard"].copy()
+model_suite["feature_columns"] = feature_columns
+model_suite["target_column"] = target_column
+model_suite["feature_scaler"] = feature_scaler
+model_suite["target_scaler"] = target_scaler
+
+# Re-evaluate saved or trained models on the current dataset without retraining.
+candidate_rows = []
+X_test_flat = X_test.reshape(len(X_test), -1)
+baseline_predictions = inverse_target_values(X_test[:, -1, target_index], target_scaler)
+
+for model_name, candidate in model_suite["models"].items():
+    try:
+        if candidate["kind"] == "baseline":
+            predictions_actual = baseline_predictions
+            notes = candidate.get("note", "Repeats the last observed target value.")
+        elif candidate.get("model") is None:
+            raise ValueError(candidate.get("load_error") or "Saved artifact could not be loaded.")
+        elif candidate["kind"] == "sequence":
+            preds_scaled = np.asarray(candidate["model"].predict(X_test, verbose=0)).reshape(-1)
+            predictions_actual = inverse_target_values(preds_scaled, target_scaler)
+            notes = candidate.get("note", "")
+        else:
+            preds_scaled = np.asarray(candidate["model"].predict(X_test_flat)).reshape(-1)
+            predictions_actual = inverse_target_values(preds_scaled, target_scaler)
+            notes = candidate.get("note", "")
+
+        candidate["predictions_actual"] = predictions_actual
+        metrics = evaluate_predictions(actual, predictions_actual)
+        candidate_rows.append({
+            "Model": model_name,
+            "Status": "trained",
+            "Notes": notes,
+            **metrics,
+        })
+    except Exception as exc:
+        candidate_rows.append({
+            "Model": model_name,
+            "Status": "failed",
+            "Notes": f"Evaluation failed: {exc}",
+            "MAE": np.nan,
+            "RMSE": np.nan,
+            "R2": np.nan,
+        })
+
+leaderboard_df = pd.DataFrame(candidate_rows)
 trained_df = rank_trained_models(leaderboard_df)
 best_model_name = get_best_model_name(leaderboard_df)
+model_suite["leaderboard"] = leaderboard_df
+model_suite["best_model_name"] = best_model_name
 
 if best_model_name is None:
     st.error("No trained models are available in the saved suite.")
@@ -1289,11 +1584,11 @@ selected_candidate = model_suite["models"][selected_model_name]
 selected_is_best = selected_model_name == best_model_name
 
 if model_suite.get("source") == "saved":
-    st.caption("Using saved model artifacts from disk for this dataset and target column.")
+    st.caption("Using saved model artifacts from disk for this target configuration.")
 elif model_suite.get("source") == "cloud":
-    st.caption("Using saved model artifacts restored from Supabase Storage for this dataset and target column.")
+    st.caption("Using saved model artifacts restored from Supabase Storage for this target configuration.")
 else:
-    st.caption("Using freshly trained model artifacts for this dataset and target column.")
+    st.caption("Using freshly trained model artifacts for this target configuration.")
 
 best_candidate = selected_candidate
 best_predictions = np.asarray(best_candidate["predictions_actual"]).reshape(-1)
@@ -1338,6 +1633,12 @@ plt.close(fig)
 st.caption("Top held-out metrics")
 st.write(trained_df[["Model", "MAE", "RMSE", "R2"]].head(5).reset_index(drop=True))
 
+direction_reference = float(test_window_df[target_column].iloc[SEQUENCE_LENGTH - 1])
+direction_metrics = compute_direction_metrics(actual, best_predictions, direction_reference)
+st.subheader("Prediction Direction")
+st.write(pd.DataFrame([direction_metrics]))
+st.caption("Direction uses the previous actual value as the reference for Up/Down.")
+
 
 # ----------------------------------------
 # Future Prediction
@@ -1355,14 +1656,15 @@ else:
 
         future_values = recursive_forecast(
             best_candidate,
-            scaled_data,
-            target_index,
-            scaler,
-            len(numeric_cols),
+            scaled_feature_data,
+            feature_columns,
+            target_column,
+            target_scaler,
             days_ahead,
             recent_target_values=df[target_column].to_numpy(),
         )
         predicted_price = float(future_values[-1])
+        direction_label = "UP" if predicted_price >= float(df[target_column].iloc[-1]) else "DOWN"
 
         if selected_is_best:
             st.success(f"Best model: {selected_model_name}")
@@ -1370,14 +1672,28 @@ else:
             st.success(f"Selected model: {selected_model_name}")
             st.info(f"Best available model remains {best_model_name}.")
         st.success(f"Predicted {target_column}: {round(predicted_price, 2)}")
+        st.info(f"Predicted Direction: {direction_label}")
 
         if st.session_state.logged_in and st.session_state.user:
-            supabase.table("predictions").insert({
+            base_payload = {
                 "user_id": st.session_state.user.id,
                 "file_name": file_name,
                 "target_column": target_column,
                 "predicted_value": float(predicted_price),
-                "prediction_date": str(user_date)
-            }).execute()
+                "prediction_date": str(user_date),
+            }
+            if supports_prediction_metadata_columns():
+                metadata_payload = {
+                    **base_payload,
+                    "prediction_direction": direction_label,
+                    "model_used": selected_model_name,
+                }
+                try:
+                    supabase.table("predictions").insert(metadata_payload).execute()
+                except Exception:
+                    st.session_state["supports_prediction_metadata_columns"] = False
+                    supabase.table("predictions").insert(base_payload).execute()
+            else:
+                supabase.table("predictions").insert(base_payload).execute()
     else:
         st.warning("Select a future date.")
