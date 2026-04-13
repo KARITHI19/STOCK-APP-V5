@@ -49,7 +49,7 @@ SUPABASE_KEY = get_secret_value("SUPABASE_KEY", "")
 SUPABASE_SERVICE_ROLE_KEY = get_secret_value("SUPABASE_SERVICE_ROLE_KEY", "") or get_secret_value("SUPABASE_SECRET_KEY", "")
 MODEL_STORAGE_BUCKET = get_secret_value("SUPABASE_MODEL_BUCKET", "model-suites")
 MODEL_STORAGE_PREFIX = get_secret_value("MODEL_STORAGE_PREFIX", "saved_suites")
-MAIN_APP_URL = get_secret_value("MAIN_APP_URL", "https://stock-app-v5-yjcge5kowmrfldftuyjk4g.streamlit.app/")
+MAIN_APP_URL = get_secret_value("MAIN_APP_URL", "http://localhost:8501/")
 RESET_APP_URL = get_secret_value("RESET_APP_URL", "https://stock-app-v5-igwqkscqgidq6buhuxksar.streamlit.app/")
 ADMIN_PANEL_URL = get_secret_value("ADMIN_PANEL_URL", "https://stock-app-v5-ekjlrgbrp3zelhxcuxgrzv.streamlit.app/")
 
